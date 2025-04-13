@@ -1,0 +1,9 @@
+/habitat-sim
+/data
+/output_dataset
+/Replica-Dataset
+/autonomous_dataset
+/test_semantic
+/test_vlms
+navigation_dataset.py
+__pycache__
