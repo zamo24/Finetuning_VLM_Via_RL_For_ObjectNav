@@ -5,5 +5,10 @@
 /autonomous_dataset
 /test_semantic
 /test_vlms
-navigation_dataset.py
 __pycache__
+/lightning_logs
+/checkpoints
+/final_adapter
+evaluate_model.py
+test_checkpoints.py
+/habitat_navigation

@@ -8,9 +8,15 @@ import torch
 from torchvision import transforms
 import time
 from qwen_vl_utils import process_vision_info
-from navigation_dataset import MyClass
+from navigation_dataset import NavigationDataset
+from torch.utils.data import DataLoader
+from spaceqwen_cql_agent import SpaceQwenCQLAgent
+from torch.nn.utils.rnn import pad_sequence
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 GOAL_DISTANCE_THRESHOLD = 2.0 # meters
+IGNORE_INDEX = -100
 
 # Function to compute angle between two 3D vectors (in degrees)
 def angle_between(vec1, vec2):
@@ -45,7 +51,6 @@ def load_peft_model_and_processor():
         "remyxai/SpaceQwen2.5-VL-3B-Instruct", 
         torch_dtype=torch.float16,
         device_map="auto",
-        low_cpu_mem_usage=True,
     )
 
     processor = AutoProcessor.from_pretrained("remyxai/SpaceQwen2.5-VL-3B-Instruct")
@@ -53,6 +58,7 @@ def load_peft_model_and_processor():
         r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"],
         lora_dropout=0.05, bias="none")
     model = get_peft_model(model, lora_config)
+    model.gradient_checkpointing_enable()
 
     return model, processor
 
@@ -88,7 +94,7 @@ def construct_prompt(processor, target_category, image):
     text = processor.apply_chat_template(
         message, tokenize=False, add_generation_prompt=True
     )
-    return text, message
+    return prompt_text, text, message
 
 # Converts the dataset into transitions
 def get_transitions_from_dataset(data_root):
@@ -109,14 +115,6 @@ def get_transitions_from_dataset(data_root):
             step_info = trajectory[i]
             next_step_info = trajectory[i+1]
             action_str = step_info["action"]
-
-            # Map action string to an index 0,1,2
-            if action_str == "move_forward":
-                action_index = 0
-            elif action_str == "turn_left":
-                action_index = 1
-            elif action_str == "turn_right":
-                action_index = 2
             
             img_path = os.path.join(episode_dir, f"images/state_{step_info['step']:04d}_rgb.png")
             next_img_path = os.path.join(episode_dir, f"images/state_{next_step_info['step']:04d}_rgb.png")
@@ -135,7 +133,7 @@ def get_transitions_from_dataset(data_root):
             transitions.append({
                 "image": img_path,
                 "next_image": next_img_path,
-                "action": action_index,
+                "action": action_str,
                 "position": position,
                 "orientation": orientation,
                 "next_position": next_position,
@@ -156,10 +154,10 @@ def get_transitions_from_dataset(data_root):
 
 # This function runs inference on the model given a message and a text prompt
 def model_inference(model, processor, message, text_prompt):
-    image_inputs, video_inputs = process_vision_info(message)
+    image_inputs, _ = process_vision_info(message)
 
     encodings = processor(
-        text=[text_prompt], images=image_inputs, videos=video_inputs,
+        text=[text_prompt], images=image_inputs,
         return_tensors="pt", padding=True
     ).to('cuda')
     input_ids = encodings["input_ids"].to('cuda')
@@ -198,6 +196,47 @@ def model_inference(model, processor, message, text_prompt):
     for text in generated_texts:
         print(text)
 
+def custom_collate_fn(batch):
+    # Filter out None samples
+    batch = [item for item in batch if item is not None]
+    if not batch: return None # Return None if batch becomes empty
+
+    elem = batch[0]
+    collated = {}
+    # Iterate through keys found in the first sample
+    for key in elem.keys():
+        if key in ["state_encoding", "next_state_encoding"]:
+            # Handle dictionary collation separately (stack tensors within dict)
+            list_of_dicts = [d[key] for d in batch]
+            inner_collated = {}
+            # Assuming all inner dicts have same keys and tensors are stackable
+            for inner_key in list_of_dicts[0].keys():
+                 try:
+                     inner_collated[inner_key] = torch.stack([d[inner_key] for d in list_of_dicts])
+                 except Exception as e:
+                      print(f"Error stacking inner key '{inner_key}' in '{key}': {e}")
+                      inner_collated[inner_key] = None
+            collated[key] = inner_collated
+
+        elif isinstance(elem[key], torch.Tensor):
+            # If it's already a tensor, stack them
+            try:
+                collated[key] = torch.stack([d[key] for d in batch])
+            except Exception as e:
+                print(f"Error stacking key '{key}': {e}")
+                if key == 'training_labels':
+                    collated[key] = pad_sequence([d[key] for d in batch], batch_first=True, padding_value=IGNORE_INDEX)
+                else:
+                     collated[key] = None # Fallback
+
+        elif isinstance(elem[key], (int, float, bool)):
+            # Convert sequences of basic types to tensors
+            collated[key] = torch.tensor([d[key] for d in batch])
+        else:
+             collated[key] = [d[key] for d in batch] # Keep as list if unsure
+
+    return collated
+
 def main():
     transitions = get_transitions_from_dataset("./output_dataset")
 
@@ -207,10 +246,11 @@ def main():
     image_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        # transforms.Normalize(mean, std) based on model requirements
+        # transforms.Normalize(mean, std)
     ])
 
     # Get text prompts, images, messages, target objects, and pixel tensors (transformed images)
+    raw_texts = []
     text_prompts = []
     images = []
     targets = []
@@ -220,18 +260,70 @@ def main():
         target_category = transition['target_category']
         image = Image.open(transition['image']).convert("RGB")
 
-        text, message = construct_prompt(processor, target_category, image)
+        raw_text, text, message = construct_prompt(processor, target_category, image)
 
+        raw_texts.append(raw_text)
         text_prompts.append(text)
         messages.append(message)
         targets.append(target_category)
         images.append(image)
         pixel_tensors.append(image_transform(image).unsqueeze(0))
 
-    obj = MyClass(20)
-    print(obj.say_hello())
+    # Pre-tokenize transitions and aggregate into trainable format using torch.utils.data.Dataset extention
+    dataset = NavigationDataset(processor, transitions, text_prompts, messages, raw_texts)
+    loader = DataLoader(
+        dataset,
+        batch_size=1, # My GPU can only fit batch size of 1 (16GB VRAM)
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=lambda batch: custom_collate_fn(batch),
+        persistent_workers=True
+    )
 
+    # Initialize CQL agent
+    rl_agent = SpaceQwenCQLAgent(model, processor)
 
+    # Define checkpointing callback
+    # checkpoint_callback = ModelCheckpoint(
+    #     dirpath='./checkpoints',
+    #     filename='spaceqwen-cql-{epoch:02d}-{train_loss:.2f}',
+    #     save_top_k=3,
+    #     monitor='train_loss',
+    #     mode='min'
+    # )
+
+    print(f"Gradient Checkpointing Enabled: {model.is_gradient_checkpointing}")
+
+    # Instantiate the Trainer
+    trainer = pl.Trainer(
+        max_epochs=2,
+        accelerator="gpu",
+        devices=1,
+        logger=True,
+        # callbacks=[checkpoint_callback],
+        gradient_clip_val=1.0,
+        precision='bf16-mixed',
+        accumulate_grad_batches=4,
+        enable_progress_bar=True,
+        # log_every_n_steps=10,
+        # val_check_interval=1.0,
+    )
+    print("Trainer configured. Starting training...")
+    start_time = time.time()
+    trainer.fit(model=rl_agent, train_dataloaders=loader)
+    elapsed_time = time.time() - start_time
+    print(f"Training took: {elapsed_time:.4f} seconds")
+
+    adapter_save_directory = "./final_adapter"
+    print(f"Saving final LoRA adapter to: {adapter_save_directory}")
+    # Access the PEFT model within LightningModule
+    peft_model = rl_agent.model
+    peft_model.save_pretrained(adapter_save_directory)
+    # rl_agent.processor.save_pretrained(adapter_save_directory)
+    print("Adapter saved.")
+    
+    print('training done')
 
 if __name__ == "__main__":
     main()
