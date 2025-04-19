@@ -9,6 +9,5 @@ __pycache__
 /lightning_logs
 /checkpoints
 /final_adapter
-evaluate_model.py
 test_checkpoints.py
 /habitat_navigation
