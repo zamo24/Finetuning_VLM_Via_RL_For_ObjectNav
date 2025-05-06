@@ -1,22 +1,31 @@
-import os, json, gzip
-from PIL import Image
+import os, json
 import numpy as np
 import math
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, GenerationConfig
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 import torch
 from torchvision import transforms
 import time
 from qwen_vl_utils import process_vision_info
 from navigation_dataset import NavigationDataset
 from torch.utils.data import DataLoader
-from spaceqwen_cql_agent import SpaceQwenCQLAgent
+from spaceqwen_awr_agent import SpaceQwenAWRAgent
 from torch.nn.utils.rnn import pad_sequence
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback
+import argparse
 
-GOAL_DISTANCE_THRESHOLD = 2.0 # meters
+GOAL_DISTANCE_THRESHOLD = 1.0 # meters
 IGNORE_INDEX = -100
+
+num_training_steps = 0
+
+class SaveLoRACallback(Callback):
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        out_dir = f"lora_failure_trans_epoch_{epoch:02d}_{num_training_steps}_training_steps"
+        pl_module.model.save_pretrained(out_dir)
+        print(f"[LoRA] Saved adapter to {out_dir}/")
 
 # Function to compute angle between two 3D vectors (in degrees)
 def angle_between(vec1, vec2):
@@ -45,56 +54,132 @@ def calculate_reward(position, next_position, orientation, target_category, targ
 
     return reward
 
-# Returns a the SpaceQwen model wrapped in a LoRA module
-def load_peft_model_and_processor():
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+# Returns the SpaceQwen model (base or with LoRA adapter) and the processor
+def load_peft_model_and_processor(lora_path=None):
+    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         "remyxai/SpaceQwen2.5-VL-3B-Instruct", 
         torch_dtype=torch.float16,
         device_map="auto",
     )
-
     processor = AutoProcessor.from_pretrained("remyxai/SpaceQwen2.5-VL-3B-Instruct")
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05, bias="none")
-    model = get_peft_model(model, lora_config)
-    model.gradient_checkpointing_enable()
-
+    if lora_path:
+        model = PeftModel.from_pretrained(base_model, lora_path, is_trainable=True)
+        print(f"Loaded LoRA adapter from {lora_path}")
+    else:
+        lora_config = LoraConfig(
+            r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05, bias="none")
+        model = get_peft_model(base_model, lora_config)
+        model.gradient_checkpointing_enable()
     return model, processor
 
-# Constructs the specialized prompt
-def construct_prompt(processor, target_category, image):
-    # Specialized prompt
-    prompt_text = (
-        f"<image> You are an agent with an RGB-D camera looking for a {target_category}. Observe the image and think"
-        f" step by step about the action you should take to eventually find the {target_category}. Once the {target_category} is found, walk up to the {target_category}, "
-        f"but do not interact with it. Look at the position of the {target_category} relative to the center of the image. If the {target_category} is nearly centered "
-        f"(e.g., within ±10–20 percent from the middle), then the best action is to move forward. Otherwise, turn in the direction that aligns the {target_category} more centrally. "
-        f"If the {target_category} is not visible, think about the best action from the available actions to take next. Reason in short sentences.\n"
-        f"Example:\nObservation: Descibe the entire image\n"
-        f"Reasoning: Think step-by-step about the best action to take to get closer to the {target_category} taking into account your observations. "
-        f"If the {target_category} is in sight, move towards it. If the {target_category} is not in sight, think about where it can be relative to your current position "
-        "and what action will get you closer to it.\nAction: Pick an action to take from { move forward, turn left, turn right }\nNow, given the current image, "
-        "please provide your Observation, detailed Reasoning, and Action from the available actions { move forward, turn left, turn right } to find the "
-        f"{target_category}. Please do not repeat this prompt; only generate your response as a JSON object. \n"
-    )
+def get_failure_transitions(data_root, transitions):
+    episode_dirs = [os.path.join(data_root, d) for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
 
-    message = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
-                {"type": "text", "text": prompt_text},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(
-        message, tokenize=False, add_generation_prompt=True
-    )
-    return prompt_text, text, message
+    num_fail_trans = 0
+    for episode_dir in episode_dirs:
+        metadata_path = os.path.join(episode_dir, "metadata.json")
+
+        with (open(metadata_path, 'r')) as f:
+            episode_data = json.load(f)
+        trajectory = episode_data["trajectory"]
+        target_category = episode_data.get("object_category", None)
+        
+        num_steps = len(trajectory)
+        prev_action = None
+        for i in range(num_steps - 1):
+            step_info = trajectory[i]
+            next_step_info = trajectory[i+1]
+            action_str = step_info["action"]
+            
+            img_path = os.path.join(episode_dir, f"images/state_{step_info['step']:04d}_rgb.png")
+            next_img_path = os.path.join(episode_dir, f"images/state_{next_step_info['step']:04d}_rgb.png")
+            
+            # Collect positions/orientations for reward calculation
+            position = step_info.get("position", None)
+            orientation = step_info.get("orientation", None)
+            
+            next_position = next_step_info.get("position", None)
+            next_orientation = next_step_info.get("orientation", None)
+
+            reward = step_info['reward']
+
+            # done = False
+            transitions.append({
+                "image": img_path,
+                "next_image": next_img_path,
+                "action": action_str,
+                "position": position,
+                "orientation": orientation,
+                "next_position": next_position,
+                "next_orientation": next_orientation,
+                "target_category": target_category,
+                # "target_position": target_position,
+                "reward": reward,
+                # "done": done
+            })
+            num_fail_trans += 1
+    
+    print("Number of failure transitions: ", num_fail_trans)
+
+def get_transitions_from_output_dataset(data_root, transitions):
+    episode_dirs = [os.path.join(data_root, d) for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
+
+    i = 0
+    for episode_dir in episode_dirs:
+        if (i % 10) == 0:
+            i += 1
+            continue
+        i += 1
+
+        metadata_path = os.path.join(episode_dir, "metadata.json")
+
+        with (open(metadata_path, 'r')) as f:
+            episode_data = json.load(f)
+        trajectory = episode_data["trajectory"]
+        target_category = episode_data.get("object_category", None)
+        target_position = episode_data.get("final_position", None)
+        
+        num_steps = len(trajectory)
+        for i in range(num_steps - 1):
+            step_info = trajectory[i]
+            next_step_info = trajectory[i+1]
+            action_str = step_info["action"]
+            
+            img_path = os.path.join(episode_dir, f"images/state_{step_info['step']:04d}_rgb.png")
+            next_img_path = os.path.join(episode_dir, f"images/state_{next_step_info['step']:04d}_rgb.png")
+            
+            # Collect positions/orientations for reward calculation
+            position = step_info.get("position", None)
+            orientation = step_info.get("orientation", None)
+            
+            next_position = next_step_info.get("position", None)
+            next_orientation = next_step_info.get("orientation", None)
+            
+            # Compute the reward
+            reward = calculate_reward(position, next_position, orientation, target_category, target_position)
+
+            transitions.append({
+                "image": img_path,
+                "next_image": next_img_path,
+                "action": action_str,
+                "position": position,
+                "orientation": orientation,
+                "next_position": next_position,
+                "next_orientation": next_orientation,
+                "target_category": target_category,
+                "target_position": target_position,
+                "reward": reward,
+                # "done": done
+            })
+
+        # Mark the final step of the episode as terminal
+        if trajectory:
+            final_step = trajectory[-1]
+            final_img_path = os.path.join(episode_dir, f"state_{final_step['step']:04d}_rgb.png")
+            transitions[-1]["done"] = True
+
+    # get_failure_transitions('./failure_dataset', transitions)
 
 # Converts the dataset into transitions
 def get_transitions_from_dataset(data_root):
@@ -141,7 +226,7 @@ def get_transitions_from_dataset(data_root):
                 "target_category": target_category,
                 "target_position": target_position,
                 "reward": reward,
-                "done": done
+                # "done": done
             })
 
         # Mark the final step of the episode as terminal
@@ -149,6 +234,13 @@ def get_transitions_from_dataset(data_root):
             final_step = trajectory[-1]
             final_img_path = os.path.join(episode_dir, f"state_{final_step['step']:04d}_rgb.png")
             transitions[-1]["done"] = True
+
+    # get_failure_transitions('./failure_dataset', transitions)
+
+    get_transitions_from_output_dataset('./output_dataset', transitions)
+
+    global num_training_steps
+    num_training_steps = len(transitions)
 
     return transitions
 
@@ -163,12 +255,6 @@ def model_inference(model, processor, message, text_prompt):
     input_ids = encodings["input_ids"].to('cuda')
     pixel_values = encodings["pixel_values"].to('cuda')
     attention_mask = encodings['attention_mask'].to('cuda')
-
-    # Prepare labels (target outputs) by tokenizing target_texts
-    # labels = processor.tokenizer(
-    #     text=targets, padding=True, truncation=True,
-    #     return_tensors="pt"
-    # )["input_ids"]
 
     gen_config = GenerationConfig(
         max_new_tokens=84,
@@ -238,69 +324,39 @@ def custom_collate_fn(batch):
     return collated
 
 def main():
-    transitions = get_transitions_from_dataset("./output_dataset")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lora-path", type=str, default=None, help="Path to LoRA adapter to load")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    args = parser.parse_args()
 
-    model, processor = load_peft_model_and_processor()
+    transitions = get_transitions_from_dataset("./train_dataset")
 
-    # Image transform to get a raw pixel tensor
-    image_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        # transforms.Normalize(mean, std)
-    ])
-
-    # Get text prompts, images, messages, target objects, and pixel tensors (transformed images)
-    raw_texts = []
-    text_prompts = []
-    images = []
-    targets = []
-    pixel_tensors = []
-    messages = []
-    for transition in transitions:
-        target_category = transition['target_category']
-        image = Image.open(transition['image']).convert("RGB")
-
-        raw_text, text, message = construct_prompt(processor, target_category, image)
-
-        raw_texts.append(raw_text)
-        text_prompts.append(text)
-        messages.append(message)
-        targets.append(target_category)
-        images.append(image)
-        pixel_tensors.append(image_transform(image).unsqueeze(0))
+    model, processor = load_peft_model_and_processor(args.lora_path)
 
     # Pre-tokenize transitions and aggregate into trainable format using torch.utils.data.Dataset extention
-    dataset = NavigationDataset(processor, transitions, text_prompts, messages, raw_texts)
+    dataset = NavigationDataset(processor, transitions)
     loader = DataLoader(
         dataset,
-        batch_size=1, # My GPU can only fit batch size of 1 (16GB VRAM)
+        batch_size=2,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         collate_fn=lambda batch: custom_collate_fn(batch),
-        persistent_workers=True
+        persistent_workers=False
     )
 
-    # Initialize CQL agent
-    rl_agent = SpaceQwenCQLAgent(model, processor)
-
-    # Define checkpointing callback
-    # checkpoint_callback = ModelCheckpoint(
-    #     dirpath='./checkpoints',
-    #     filename='spaceqwen-cql-{epoch:02d}-{train_loss:.2f}',
-    #     save_top_k=3,
-    #     monitor='train_loss',
-    #     mode='min'
-    # )
+    # Initialize AWR agent
+    rl_agent = SpaceQwenAWRAgent(model, processor)
 
     print(f"Gradient Checkpointing Enabled: {model.is_gradient_checkpointing}")
 
     # Instantiate the Trainer
     trainer = pl.Trainer(
-        max_epochs=2,
+        max_epochs=args.epochs,
         accelerator="gpu",
         devices=1,
         logger=True,
+        callbacks=[SaveLoRACallback()],
         # callbacks=[checkpoint_callback],
         gradient_clip_val=1.0,
         precision='bf16-mixed',
@@ -315,12 +371,11 @@ def main():
     elapsed_time = time.time() - start_time
     print(f"Training took: {elapsed_time:.4f} seconds")
 
-    adapter_save_directory = "./final_adapter"
+    adapter_save_directory = f"./final_adapter_{num_training_steps}_training_steps"
     print(f"Saving final LoRA adapter to: {adapter_save_directory}")
     # Access the PEFT model within LightningModule
     peft_model = rl_agent.model
     peft_model.save_pretrained(adapter_save_directory)
-    # rl_agent.processor.save_pretrained(adapter_save_directory)
     print("Adapter saved.")
     
     print('training done')

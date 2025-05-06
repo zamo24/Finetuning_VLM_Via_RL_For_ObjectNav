@@ -10,10 +10,18 @@ import cv2
 import threading
 import magnum as mn
 import segmentation_models_pytorch as smp
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor, BitsAndBytesConfig
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, GenerationConfig
 from qwen_vl_utils import process_vision_info
 import torch
 import random
+import argparse
+
+DEFAULT_DATASET_DIR = "../../../autonomous_dataset"
+DEFAULT_MODEL_PATH = "remyxai/SpaceQwen2.5-VL-3B-Instruct"
+DEFAULT_PROCESSOR_PATH = "remyxai/SpaceQwen2.5-VL-3B-Instruct"
+DEFAULT_SCENE_CONFIG = "./hm3d_v0.2/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VALID_ACTIONS = ["move forward", "turn left", "turn right"]
 
 # Create a Habitat-Sim configuration with RGB, depth, and optional semantic sensors
 def make_sim_config(scene_dataset_config_file, scene_id, width=1280, height=720, include_semantic=True):  
@@ -80,110 +88,114 @@ def load_episode_json(file_path):
     with gzip.open(file_path, 'rt', encoding='utf-8') as file:
         return json.load(file)
     
-def load_model_and_processor():
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "remyxai/SpaceQwen2.5-VL-3B-Instruct", 
+def load_model_and_processor(model_path, processor_path, lora_path, device):
+    """Loads the VLM model and processor, optionally merging LoRA."""
+    print(f"Loading base model from: {model_path}")
+    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_path,
         torch_dtype=torch.float16,
-        # quantization_config=quant_config,
-        device_map="auto",
-        low_cpu_mem_usage=True,
-    )
-    processor = AutoProcessor.from_pretrained("remyxai/SpaceQwen2.5-VL-3B-Instruct")
+        # device_map=device, # Load on CPU if memory constrained during merge
+        trust_remote_code=True
+    ) #.to(device) # Move later
 
+    model = base_model # Start with base model
+    if lora_path:
+        print(f"Attempting to load LoRA adapter from: {lora_path}")
+        try:
+            from peft import PeftModel # Ensure PeftModel is imported
+            model_with_adapter = PeftModel.from_pretrained(base_model, lora_path)
+            print("LoRA adapter loaded.")
+            merged_model = model_with_adapter.merge_and_unload()
+            print("LoRA adapter merged.")
+            model = merged_model
+            # Optionally delete intermediate models if memory is tight
+            # del base_model
+            # del model_with_adapter
+        except ImportError:
+             print("Warning: PEFT library not found. Cannot merge LoRA. Install with 'pip install peft'. Using base model.")
+        except Exception as e:
+            print(f"Error loading/merging LoRA: {e}. Using base model.")
+
+    model = model.to(device).eval() # Move final model to device and set to eval
+    print(f"Model ready on {device}.")
+
+    print(f"Loading processor from: {processor_path}")
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
+    print("Processor loaded.")
     return model, processor
 
-def predict_action(model, processor, image):
+def predict_action(model, processor, image, target_category, device):
+    """ Predicts an action using the VLM. Returns (final_action, was_originally_valid) """
     prompt_text = (
-        "<image> You are an agent with an RGB-D camera looking for a television. Observe the image and think"
-        " step by step about the action you should take to eventually find the television. Once the television is found, walk up to the television, "
-        "but do not interact with it. Look at the position of the TV relative to the center of the image. If the TV is nearly centered "
-        "(e.g., within ±10–20 percent from the middle), then the best action is to move forward. Otherwise, turn in the direction that aligns the TV more centrally. "
-        "If the television is not visible, think about the best action from the available actions to take next. Reason in short sentences.\n"
-        "Example:\nObservation: Descibe the entire image\n"
-        "Reasoning: Think step-by-step about the best action to take to get closer to the television taking into account your observations. "
-        "If the television is in sight, move towards it. If the television is not in sight, think about where it can be relative to your current position "
-        "and what action will get you closer to it.\nAction: Pick an action to take from { move forward, turn left, turn right }\nNow, given the current image, "
-        "please provide your Observation, detailed Reasoning, and Action from the available actions { move forward, turn left, turn right } to find the television. "
-        "Please do not repeat this prompt; only generate your response as a JSON object. \n"
+         f"<image> You are an agent with an RGB-D camera looking for a {target_category}. Observe the image and think"
+         f" step by step about the action you should take to eventually find the {target_category}. Once the {target_category} is found, walk up to the {target_category}, "
+         f"but do not interact with it. Look at the position of the {target_category} relative to the center of the image. If the {target_category} is nearly centered "
+         f"(e.g., within ±10–20 percent from the middle), then the best action is to move forward. Otherwise, turn in the direction that aligns the {target_category} more centrally."
+         f"If the {target_category} is not visible, think about what room you are in based on the objects you see. Reason in short sentences.\n"
+         "Example:\n {\n\"Observation\": \"Descibe the entire image\",\n"
+         f"\"Reasoning\": \"Think step-by-step about the best action to take to get closer to the {target_category} taking into account your observations. "
+         f"If the {target_category} is in sight, move towards it. If the {target_category} is not in sight, think about where it can be relative to your current position "
+         "and what action will get you closer to it.\",\n\"Action\": \"Pick an action to take from { move forward, turn left, turn right }\"\n}\nNow, given the current image, "
+         "please provide your Observation, detailed Reasoning, and Action from the available actions { move forward, turn left, turn right } to find the "
+         f"{target_category}. Please do not repeat this prompt; only generate your response as a valid JSON object. Do now forget the commas in the JSON object!\n"
     )
+    message = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt_text}]}]
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
-                {"type": "text", "text": prompt_text},
-            ],
-        }
-    ]
-
-    # print(messages)
-
-    # Preparation for inference
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to("cuda")
-
-    # Inference: Generation of the output
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=128,
-    #     do_sample=False,
-    #     temperature=0.90,
-    #     num_beams=1,
-    #     # min_length=128,
-    #     top_p=0.80,
-    #     repetition_penalty=10.0,
-    #     length_penalty=1.0,
-    )
-
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True
-    )
-    print(output_text[0])
-
-    _, sep, vlm_output = output_text[0].partition("json")
-    if sep:
-        vlm_output, sep, _ = vlm_output.partition("```")
-    else:
-        vlm_output = output_text[0]
-
-    # print("here")
-    # if sep:
-    #     print("VLM output: ", vlm_output)
+    was_originally_valid = False
+    final_action = np.random.choice(VALID_ACTIONS) # Default fallback
 
     try:
-        answer = json.loads(vlm_output)
-        action = answer['Action']
-    except json.JSONDecodeError as e:
-        # Use a random action
-        rand_int = random.randint(0, 2)
+        text = processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+        image_input, _ = process_vision_info(message)
+        inputs = processor(text=[text], images=image_input, return_tensors="pt", padding=True).to(device)
 
-        if rand_int == 0:
-            action = "move forward"
-        elif rand_int == 1:
-            action = "turn right"
-        else:
-            action = "turn left"
+        gen_config = GenerationConfig(max_new_tokens=256,
+                                      pad_token_id=processor.tokenizer.pad_token_id,
+                                      eos_token_id=processor.tokenizer.eos_token_id,
+                                      repetition_penalty=1.05,   # <-- activates the processor
+                                    #   no_repeat_ngram_size=3,
+                                    )
 
-    print('Action: ', action)
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, generation_config=gen_config)
+        generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
+        output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True)[0]
 
-    return action
+        _, sep, vlm_output = output_text.partition("json")
+        if sep: vlm_output, _, _ = vlm_output.partition("```")
+        else: vlm_output = output_text # Fallback if json marker not found
+
+        # Strip potential leading/trailing whitespace before parsing JSON
+        vlm_output = vlm_output.strip()
+        try:
+            # print(vlm_output)
+            answer = json.loads(vlm_output)
+            initial_predicted_action = answer.get('Action', '').lower() # Use .get for safety
+
+            if initial_predicted_action in VALID_ACTIONS:
+                was_originally_valid = True
+                final_action = initial_predicted_action
+            else:
+                 if initial_predicted_action: # Only warn if it predicted *something* invalid
+                     print(f"Warning: Model predicted invalid action '{initial_predicted_action}'. Using random: {final_action}.")
+                 else: # Warn if Action key was missing or empty
+                    #  print(f"Warning: Could not find valid 'Action' in model JSON output: {vlm_output}. Using random: {final_action}.")
+                    print(f"Warning: Could not find valid 'Action' in model JSON output. Using random: {final_action}.")
+
+        except json.JSONDecodeError:
+            for action in VALID_ACTIONS:
+                 if action in vlm_output:
+                    was_originally_valid = True
+                    final_action = action
+
+            if not was_originally_valid:
+                print(f"Warning: Could not decode JSON from model output: '{vlm_output}'. Using random: {final_action}")
+
+
+    except Exception as e:
+        print(f"Error during model prediction/processing: {e}. Using random action: {final_action}")
+
+    return final_action, was_originally_valid
 
 
 # Control the agent interactively using keyboard inputs.
@@ -192,7 +204,7 @@ def predict_action(model, processor, image):
 #     - A: turn_left
 #     - D: turn_right
 #     - Q: quit and finish recording
-def autonomous_agent(sim, agent, id_to_name, images_dir, include_semantic=True):
+def autonomous_agent(args, sim, agent, id_to_name, images_dir, target_category, include_semantic=False):
     trajectory = []
     actions = []
     step = 0
@@ -202,7 +214,7 @@ def autonomous_agent(sim, agent, id_to_name, images_dir, include_semantic=True):
     # print("  Press D to turn_right")
     # print("  Press Q to quit")
 
-    model, processor = load_model_and_processor()
+    model, processor = load_model_and_processor(args.model_path, args.processor_path, args.lora_path, DEVICE)
 
     # seg_model = smp.DeepLabV3Plus(encoder_name="resnet50", encoder_weights="imagenet", classes=21, activation=None)
     
@@ -228,17 +240,17 @@ def autonomous_agent(sim, agent, id_to_name, images_dir, include_semantic=True):
 
         image = Image.fromarray(rgb)
 
-        action = predict_action(model, processor, image)
+        action, _ = predict_action(model, processor, image, target_category, DEVICE)
         
         sim.step(action)
         actions.append(action)
         agent_state = agent.get_state()
         rgb_state = agent_state.sensor_states['rgb']
-        print("RGB sensor position:", rgb_state.position, "rotation:", rgb_state.rotation)
+        # print("RGB sensor position:", rgb_state.position, "rotation:", rgb_state.rotation)
 
         if include_semantic:
             semantic_state = agent_state.sensor_states['semantic']
-            print("Semantic sensor position:", semantic_state.position, "rotation:", semantic_state.rotation)
+            # print("Semantic sensor position:", semantic_state.position, "rotation:", semantic_state.rotation)
             semantic_info = obs['semantic']
             visible_objects = get_object_bboxes(semantic_info, id_to_name)
 
@@ -294,11 +306,11 @@ def get_object_bboxes(semantic, id_to_name):
     
     return visible_objects
 
-def main():
+def main(args):
     # Configuration paths
     scene_dataset_config_file = "./hm3d_v0.2/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
     objectnav_dataset_path = "../../../data/datasets/objectnav/hm3d/v2/objectnav_hm3d_v2"
-    output_dir = "../../../autonomous_dataset"
+    output_dir = DEFAULT_DATASET_DIR
 
     if not os.path.exists(scene_dataset_config_file):
         raise FileNotFoundError(f"Scene dataset config file not found at {scene_dataset_config_file}")
@@ -334,6 +346,7 @@ def main():
                 print("start position: ", start_position)
                 start_rotation = episode['start_rotation']
                 print("Selected episode with scene:", scene_id)
+                object_category = episode.get('object_category', 'unknown')
 
                 # Create output directory for this episode.
                 ep_dir = os.path.join(output_dir, f"episode_{ep_idx:04d}")
@@ -358,7 +371,7 @@ def main():
                 agent.set_state(agent_state)
 
                 print("Entering interactive control mode. Use W, A, D to control the agent; Q to quit.")
-                actions, trajectory = autonomous_agent(sim, agent, category_id_map, images_dir, include_semantic=False)
+                actions, trajectory = autonomous_agent(args, sim, agent, category_id_map, images_dir, object_category, include_semantic=False)
 
                 metadata = {
                     "scene_id": scene_id,
@@ -380,4 +393,12 @@ def main():
                 continue
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate VLM Navigation Agent (Autonomous & Expert Path)")
+    parser.add_argument("--visualize",action="store_true",default=False,help="Enable OpenCV visualization for both runs.")
+    parser.add_argument("--dataset-dir",type=str,default=DEFAULT_DATASET_DIR,help="Path to the episode dataset directory.")
+    parser.add_argument("--model-path",type=str,default=DEFAULT_MODEL_PATH,help="Path to the BASE VLM model.")
+    parser.add_argument("--processor-path",type=str,default=DEFAULT_PROCESSOR_PATH,help="Path to the VLM processor.")
+    parser.add_argument("--scene-config",type=str,default=DEFAULT_SCENE_CONFIG,help="Path to Habitat scene config.")
+    parser.add_argument("--lora-path",type=str,default=None,help="Path to the trained LoRA adapter directory (optional).")
+    args = parser.parse_args()
+    main(args)

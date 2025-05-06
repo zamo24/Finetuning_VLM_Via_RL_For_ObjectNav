@@ -11,3 +11,13 @@ __pycache__
 /final_adapter
 test_checkpoints.py
 /habitat_navigation
+/Replica-Dataset
+/train_dataset
+/validation_dataset
+/failure_dataset
+create_gif.py
+/gifs
+/final_adapter_24002_training_steps
+/lora_epoch_00_24002_training_steps
+/lora_failure_trans_epoch_00_1325_training_steps
+output_dataset.zip

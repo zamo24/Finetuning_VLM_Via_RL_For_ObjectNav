@@ -5,8 +5,18 @@ from qwen_vl_utils import process_vision_info
 # Define the fixed maximum length for the training labels.
 MAX_LABEL_LENGTH = 512
 IGNORE_INDEX = -100
+ACTION_MAP = {
+    "move_forward": "move forward",
+    "move forward": "move forward",
+    "turn_left": "turn left",
+    "turn left": "turn left",
+    "turn_right": "turn right",
+    "turn right": "turn right"
+}
 
-# Constructs a fixed-length target label for teacher forcing
+# Creates training labels where only the tokens corresponding to the
+# LAST occurrence of `action_text` within the tokenized `target_template`
+# are unmasked. Everything else is set to IGNORE_INDEX.
 def construct_action_label(tokenizer, action_text, text_prompt, max_length=MAX_LABEL_LENGTH):
     if tokenizer.pad_token is None:
         if tokenizer.eos_token:
@@ -14,14 +24,6 @@ def construct_action_label(tokenizer, action_text, text_prompt, max_length=MAX_L
         else:
             raise ValueError("Tokenizer must have a pad_token or eos_token set.")
     pad_token_id = tokenizer.pad_token_id
-
-    quote_token_id_list = tokenizer.encode('"', add_special_tokens=False)
-    if not quote_token_id_list:
-        # Handle tokenizers that might not encode quote alone or error
-        print("Warning: Could not encode quote token '\"'. End boundary detection might fail.")
-        quote_token_id = None
-    else:
-        quote_token_id = quote_token_id_list[0]
 
     target_template = f"{str(text_prompt)}\n" + '{ "Observation": "", "Reasoning": "", "Action": "' + str(action_text) + '" }'
 
@@ -31,132 +33,78 @@ def construct_action_label(tokenizer, action_text, text_prompt, max_length=MAX_L
         max_length=max_length,
         padding="max_length",
         truncation=True,
-        padding_side=padding_side,
         return_tensors="pt"
     )
-    original_ids = encoding["input_ids"][0].clone()
-    labels = encoding["input_ids"][0].clone()
-    labels_list = labels.tolist()
+    # Use input_ids directly as the source, keeping padding for length consistency
+    template_token_ids = encoding["input_ids"][0]
+    template_tokens_list = template_token_ids.tolist()
 
-    possible_keys = [
-        '"Action":', ' "Action":', '"Action": ', ' "Action": ', 'Action":', 'Action:'
-    ]
-    action_key_ids_found = None
-    found_key_str_used = None
-    initial_action_start_idx = None # Index right after the key pattern
-    final_action_start_idx = None   # Index after skipping space/quote
+    action_token_ids = tokenizer.encode(action_text, add_special_tokens=False)
 
-    for key_str in possible_keys:
-        key_ids_candidate = tokenizer.encode(key_str, add_special_tokens=False)
-        if not key_ids_candidate: continue
+    if not action_token_ids:
+        print(f"Warning: Could not tokenize action_text: '{action_text}'")
+        # Return a fully masked label tensor
+        return torch.full_like(template_token_ids, IGNORE_INDEX)
 
-        for i in range(len(labels_list) - len(key_ids_candidate) + 1):
-            if labels_list[i : i + len(key_ids_candidate)] == key_ids_candidate:
-                initial_action_start_idx = i + len(key_ids_candidate)
-                action_key_ids_found = key_ids_candidate
-                found_key_str_used = key_str
+    action_val_start_idx = -1
+    len_action = len(action_token_ids)
+    len_template = len(template_tokens_list)
 
-                current_idx = initial_action_start_idx
-                num_skipped = 0
-                skipped_tokens = []
+    for i in range(len_template - len_action, -1, -1):
+         if template_tokens_list[i : i + len_action] == action_token_ids:
+              action_val_start_idx = i
+              break
 
-                # Common space prefixes/representations used by tokenizers
-                space_indicators = ['Ġ', ' ', '_']
+    labels = torch.full_like(template_token_ids, IGNORE_INDEX)
 
-                # Try skipping up to 2 tokens
-                for iter_num in range(2):
-                    if current_idx < len(labels_list):
-                        next_token_id = labels_list[current_idx]
-                        token_string = None
-                        is_convertible = True
-                        # Get the token string representation directly
-                        try:
-                            # Use convert_ids_to_tokens which gives the underlying token representation
-                            token_string = tokenizer.convert_ids_to_tokens([next_token_id])[0]
-                        except Exception as e:
-                            # Fallback to decode if convert fails? Or just mark as not convertible
-                            try:
-                                 token_string = tokenizer.decode([next_token_id])
-                            except:
-                                 is_convertible = False
+    if action_val_start_idx != -1:
+        action_val_end_idx = action_val_start_idx + len_action
+        labels[action_val_start_idx : action_val_end_idx] = template_token_ids[action_val_start_idx : action_val_end_idx]
+        num_unmasked = (labels != IGNORE_INDEX).sum().item()
 
-                        is_space_variant = False
-                        if is_convertible and token_string is not None:
-                            # Check if the token string itself represents space or starts with a space prefix
-                            is_space_variant = token_string.isspace() or \
-                                               any(token_string.startswith(prefix) for prefix in space_indicators)
-                        else:
-                             is_space_variant = False
-
-
-                        # Explicitly check for quote using the ID
-                        is_quote = (quote_token_id is not None and next_token_id == quote_token_id)
-
-                        # Check if the token qualifies as skippable (space variant OR quote)
-                        if is_space_variant or is_quote:
-                            skipped_tokens.append(f"'{token_string}' (ID:{next_token_id})")
-                            current_idx += 1 # Actually advance index for next check/final value
-                            num_skipped += 1
-                        else:
-                            break # Exit the skipping loop (found non-space/quote)
-                    else:
-                        break # Exit loop if end of sequence reached
-
-                final_action_start_idx = current_idx # This is the index AFTER the last skipped token
-                break # Exit inner loop (key instance found)
-        if final_action_start_idx is not None:
-            break # Exit outer loop (key type found and processed)
-
-
-    if final_action_start_idx is None: # Check if loop finished without finding key/start
-        print(f"ERROR: Could not find action key in template:\n{target_template}")
-        print(f"Tokenized IDs ({padding_side}-padded): {labels_list}")
-        raise ValueError("Action key not found in the tokenized target after trying variations.")
-
-    # Find Action end index
-    action_end_idx = None
-    if quote_token_id is not None:
-        for j in range(final_action_start_idx, len(labels_list)):
-            if labels_list[j] == pad_token_id:
-                action_end_idx = j
-                break
-            if labels_list[j] == quote_token_id:
-                action_end_idx = j
-                break
-        # If loop finished without break (no quote/padding found):
-        if action_end_idx is None and j == len(labels_list) - 1:
-             action_end_idx = len(labels_list)
-
-    if action_end_idx is None:
-        print(f"Warning: Closing quote/padding for action value not found after index {final_action_start_idx}. Supervising until sequence end (length {max_length}).")
-        action_end_idx = max_length
-
-    # Mask all takens besides the action token(s)
-    if final_action_start_idx >= 0:
-         labels[:final_action_start_idx] = IGNORE_INDEX
+        if num_unmasked != len_action:
+             print(f"Warning: Number of unmasked tokens ({num_unmasked}) doesn't match action token length ({len_action})")
     else:
-         print("Warning: final_action_start_idx is negative, not masking beginning.")
-    if action_end_idx <= max_length:
-         labels[action_end_idx:] = IGNORE_INDEX
-    else:
-         print("Warning: action_end_idx is beyond max_length, not masking end.")
-
-
-    # Mask padding tokens
-    if pad_token_id is not None:
-        padding_mask = (original_ids == pad_token_id)
-        # Count changes only if masking actually happens
-        if padding_mask.any():
-             initial_ignored = (labels == IGNORE_INDEX).sum()
-             labels[padding_mask] = IGNORE_INDEX
-             final_ignored = (labels == IGNORE_INDEX).sum()
-             if final_ignored > initial_ignored:
-                  print(f"Explicitly masked {final_ignored - initial_ignored} padding tokens (ID: {pad_token_id}).")
+        print(f"Warning: Could not find action token sequence {action_token_ids} for '{action_text}' in the tokenized template.")
 
     return labels
 
+# Constructs the specialized prompt
+def construct_prompt(processor, target_category, image):
+    # Specialized prompt
+    prompt_text = (
+         f"<image> You are an agent with an RGB-D camera looking for a {target_category}. Observe the image and think"
+         f" step by step about the action you should take to eventually find the {target_category}. Once the {target_category} is found, walk up to the {target_category}, "
+         f"but do not interact with it. Look at the position of the {target_category} relative to the center of the image. If the {target_category} is nearly centered "
+         f"(e.g., within ±10–20 percent from the middle), then the best action is to move forward. Otherwise, turn in the direction that aligns the {target_category} more centrally."
+         f"If the {target_category} is not visible, think about what room you are in based on the objects you see. Reason in short sentences.\n"
+         "Example:\n {\n\"Observation\": \"Descibe the entire image\",\n"
+         f"\"Reasoning\": \"Think step-by-step about the best action to take to get closer to the {target_category} taking into account your observations. "
+         f"If the {target_category} is in sight, move towards it. If the {target_category} is not in sight, think about where it can be relative to your current position "
+         "and what action will get you closer to it.\",\n\"Action\": \"Pick an action to take from { move forward, turn left, turn right }\"\n}\nNow, given the current image, "
+         "please provide your Observation, detailed Reasoning, and Action from the available actions { move forward, turn left, turn right } to find the "
+         f"{target_category}. Please do not repeat this prompt; only generate your response as a valid JSON object. Do now forget the commas in the JSON object!"
+    )
+
+    message = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(
+        message, tokenize=False, add_generation_prompt=True
+    )
+    return prompt_text, text
+
 class NavigationDataset(torch.utils.data.Dataset):
-    def __init__(self, processor, transitions, text_prompts, messages, raw_texts):
+    def __init__(self, processor, transitions):
         print(f"Initializing NavigationDataset with {len(transitions)} transitions...")
         self.processor = processor
         # Store data needed to process one item in __getitem__
@@ -164,20 +112,10 @@ class NavigationDataset(torch.utils.data.Dataset):
         self.valid_indices = len(transitions) - 1
         self.transitions = transitions[:self.valid_indices] # Only store necessary transitions
         self.next_transitions = transitions[1:] # Store next state info separately
-        self.text_prompts = text_prompts[:self.valid_indices]
-        self.next_text_prompts = text_prompts[1:]
-        self.messages = messages[:self.valid_indices]
-        self.next_messages = messages[1:]
-        self.raw_texts = raw_texts[:self.valid_indices]
 
         # Check lengths match
         assert len(self.transitions) == self.valid_indices
-        assert len(self.text_prompts) == self.valid_indices
-        assert len(self.messages) == self.valid_indices
-        assert len(self.raw_texts) == self.valid_indices
         assert len(self.next_transitions) == self.valid_indices
-        assert len(self.next_text_prompts) == self.valid_indices
-        assert len(self.next_messages) == self.valid_indices
 
         print(f"Dataset initialized. Processing will occur in __getitem__ for {self.valid_indices} samples.")
 
@@ -191,14 +129,13 @@ class NavigationDataset(torch.utils.data.Dataset):
 
         # Get data for the current transition (state, action, reward)
         curr_trans = self.transitions[idx]
-        text_prompt = self.text_prompts[idx]
-        raw_text = self.raw_texts[idx]
+        raw_text, text_prompt = construct_prompt(self.processor, curr_trans['target_category'], Image.open(curr_trans['image']).convert("RGB"))
         action_str = curr_trans['action']
         reward = curr_trans['reward']
 
         # Get data for the next state
         next_trans = self.next_transitions[idx]
-        next_text_prompt = self.next_text_prompts[idx]
+        _, next_text_prompt = construct_prompt(self.processor, next_trans['target_category'], Image.open(next_trans['image']).convert("RGB"))
 
         # Process state
         try:
@@ -246,17 +183,18 @@ class NavigationDataset(torch.utils.data.Dataset):
             print(f"Error encoding next state for index {idx}: {e}")
             return None
 
-        # action_ids = self.processor.tokenizer.encode(action_str, add_special_tokens=False)
-        # target_category_ids = self.processor.tokenizer.encode(target_category_str, add_special_tokens=False)
-
         # Construct the training label
         try:
             training_labels = construct_action_label(
                 self.processor.tokenizer,
-                action_str,
+                ACTION_MAP[action_str],
                 raw_text,
                 max_length=MAX_LABEL_LENGTH
             )
+
+            # tensor = torch.where(training_labels == -100, torch.full_like(training_labels, self.processor.tokenizer.pad_token_id), training_labels)
+            # decoded_label = self.processor.tokenizer.decode(tensor, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            # print("Trianing label: ", decoded_label)
         except Exception as e:
              print(f"Error constructing label for index {idx}: {e}")
              return None
