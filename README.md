@@ -16,7 +16,7 @@ This repository contains all the code, data‑generation scripts and training ut
 
 ### Agent Performance
 
-![Results](/finetune_results.png)
+![Results](/images/finetune_results.png)
 
 - **SR** – Autonomous episode success rate (reach target within 1 m).
 - **EPA** – Percentage of expert actions matched along the expert path.
@@ -31,7 +31,7 @@ The second half of the same image (Table III) shows how often each agent gets *
 
 ## Qualitative Example
 
-![Example](main_figure.png)
+![Example](/images/main_figure.png)
 
 *Left:* my prompt template plus the RGB frame.
 
