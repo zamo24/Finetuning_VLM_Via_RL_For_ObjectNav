@@ -23,7 +23,7 @@ num_training_steps = 0
 class SaveLoRACallback(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch
-        out_dir = f"lora_failure_trans_epoch_{epoch:02d}_{num_training_steps}_training_steps"
+        out_dir = f"lora_epoch_{epoch:02d}_{num_training_steps}_training_steps"
         pl_module.model.save_pretrained(out_dir)
         print(f"[LoRA] Saved adapter to {out_dir}/")
 
