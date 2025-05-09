@@ -20,4 +20,5 @@ create_gif.py
 /final_adapter_24002_training_steps
 /lora_epoch_00_24002_training_steps
 /lora_failure_trans_epoch_00_1325_training_steps
+/lora_epoch_01_24002_training_steps
 output_dataset.zip

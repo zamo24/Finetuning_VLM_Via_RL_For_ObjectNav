@@ -4,10 +4,10 @@
 
 This repository contains all the code, data‑generation scripts and training utilities used in my experiments on **fine‑tuning a vision‑language model (SpaceQwen 2.5‑VL‑3B‑Instruct) for Object Navigation** (ObjectNav) with a advantage‑weighted regression (RWR/AWR‑style) objective and LoRA adapters.  In short, I:
 
-1. **Collect RGB‑D expert trajectories** in Habitat‑Sim using `create_objectnav_dataset.py`.
+1. **Collect RGB expert trajectories** in Habitat‑Sim using `create_objectnav_dataset.py`.
 2. **Convert trajectories into transitions** with task‑specific rewards (`calculate_reward` in `finetune_model.py`).
 3. **Fine‑tune only the LoRA adapter layers** of the VLM via the `SpaceQwenAWRAgent` Lightning module.
-4. **Evaluate** frozen vs.\ fine‑tuned policies both on expert‑path action accuracy (EPA) and autonomous success rate (SR).
+4. **Evaluate** frozen vs. fine‑tuned policies both on expert‑path action accuracy (EPA) and autonomous success rate (SR).
 5. **Mine failure cases** (oscillation / collisions) with `failure_miner.py` for iterative dataset augmentation.
 
 ---
@@ -43,12 +43,12 @@ The second half of the same image (Table III) shows how often each agent gets *
 
 | Path                          | Purpose                                                                           |
 | ----------------------------- | --------------------------------------------------------------------------------- |
-| `create_objectnav_dataset.py` | Interactive data‑collection tool for Habitat‑Sim episodes.                        |
-| `navigation_dataset.py`       | Lazy dataset that builds tokenised transitions on‑the‑fly.                        |
-| `spaceqwen_awr_agent.py`    | PyTorch Lightning module implementing RWR/AWR with LoRA L2 and entropy bonus.     |
-| `finetune_model.py`           | End‑to‑end training script (CLI flags for LoRA path, epochs, etc.).               |
-| `evaluate_model.py`           | Evaluation on held‑out episodes – computes SR, EPA, valid‑action %.               |
-| `failure_miner.py`            | Runs policy, detects oscillation/collisions, stores them into `failure_dataset/`. |
+| `collect_data/create_objectnav_dataset.py` | Interactive data‑collection tool for Habitat‑Sim episodes.                                    |
+| `train/navigation_dataset.py`              | Lazy dataset that builds tokenised transitions on‑the‑fly.                                  |
+| `train/spaceqwen_awr_agent.py`             | PyTorch Lightning module implementing RWR/AWR with LoRA L2 and entropy bonus.                               |
+| `train/finetune_model.py`                  | End‑to‑end training script (CLI flags for LoRA path, epochs, etc.).                                       |
+| `evaluation/evaluate_model.py`             | Evaluation on held‑out episodes – computes SR, EPA, valid‑action %.                              |
+| `collect_data/failure_miner.py`            | Runs policy, detects oscillation/collisions, stores them into `failure_dataset/`.                          |
 
 ---
 
